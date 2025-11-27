@@ -44,7 +44,7 @@ df_returns = df.pct_change().fillna(0)
 
 
 """
-Problem 1: 
+Problem 1:
 
 Implement an equal weighting strategy as dataframe "eqw". Please do "not" include SPY.
 """
@@ -59,13 +59,11 @@ class EqualWeightPortfolio:
         assets = df.columns[df.columns != self.exclude]
         self.portfolio_weights = pd.DataFrame(index=df.index, columns=df.columns)
 
-        """
-        TODO: Complete Task 1 Below
-        """
+        num_assets = len(assets)
+        weight = 1.0 / num_assets
 
-        """
-        TODO: Complete Task 1 Above
-        """
+        for asset in assets:
+            self.portfolio_weights[asset] = weight
         self.portfolio_weights.ffill(inplace=True)
         self.portfolio_weights.fillna(0, inplace=True)
 
@@ -110,15 +108,21 @@ class RiskParityPortfolio:
         # Calculate the portfolio weights
         self.portfolio_weights = pd.DataFrame(index=df.index, columns=df.columns)
 
-        """
-        TODO: Complete Task 2 Below
-        """
+        # Calculate rolling volatility
+        # Exclude the first row (0.0 due to pct_change) to match the logic of starting from valid returns
+        volatility = df_returns[assets].iloc[1:].rolling(window=self.lookback).std()
 
+        # Shift to use past data for current decision (rebalance at t uses data up to t-1)
+        volatility = volatility.shift(1)
 
+        # Calculate inverse volatility
+        inv_volatility = 1.0 / volatility
 
-        """
-        TODO: Complete Task 2 Above
-        """
+        # Calculate weights
+        sum_inv_vol = inv_volatility.sum(axis=1)
+        weights = inv_volatility.div(sum_inv_vol, axis=0)
+
+        self.portfolio_weights[assets] = weights
 
         self.portfolio_weights.ffill(inplace=True)
         self.portfolio_weights.fillna(0, inplace=True)
@@ -184,18 +188,21 @@ class MeanVariancePortfolio:
             env.setParam("DualReductions", 0)
             env.start()
             with gp.Model(env=env, name="portfolio") as model:
-                """
-                TODO: Complete Task 3 Below
-                """
+                # Define objective: Maximize w^T * mu - (gamma / 2) * w^T * Sigma * w
+                # Note: Gurobi minimizes by default if not specified, but we use MAXIMIZE
+                # Define decision variables
+                w = model.addMVar(n, name="w")
 
-                # Sample Code: Initialize Decision w and the Objective
-                # NOTE: You can modify the following code
-                w = model.addMVar(n, name="w", ub=1)
-                model.setObjective(w.sum(), gp.GRB.MAXIMIZE)
+                # Term 1: w @ mu
+                term1 = w @ mu
+                # Term 2: w @ Sigma @ w
+                term2 = w @ Sigma @ w
 
-                """
-                TODO: Complete Task 3 Above
-                """
+                obj = term1 - (gamma / 2) * term2
+                model.setObjective(obj, gp.GRB.MAXIMIZE)
+
+                # Add constraint: sum(w) = 1
+                model.addConstr(w.sum() == 1, "budget")
                 model.optimize()
 
                 # Check if the status is INF_OR_UNBD (code 4)
@@ -277,6 +284,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     judge = AssignmentJudge()
-    
+
     # All grading logic is protected in grader.py
     judge.run_grading(args)
