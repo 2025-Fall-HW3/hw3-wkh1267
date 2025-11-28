@@ -74,85 +74,73 @@ class MyPortfolio:
         """
         TODO: Complete Task 4 Below
         """
-        # --- STRATEGY: Concentrated Momentum (Top 4) + Min Variance ---
+        # --- 策略邏輯：動量篩選 + 逆波動度加權 ---
 
-        # Configuration
-        # 126 days (6 months) is optimal for capturing Sector trends
-        robust_lookback = 126
-        rebalance_freq = 21  # Monthly
-        n_top = 4            # Focus on the Top 4 winners (High Conviction)
+        # 定義可投資資產（排除 SPY/Benchmark）
+        assets = self.price.columns[self.price.columns != self.exclude]
 
-        # 1. Warm-up Period: Equal Weights
-        # Crucial for 2012-2013 performance. Avoids cash drag.
-        if n_assets > 0:
-            self.portfolio_weights.loc[self.price.index[:robust_lookback], universe] = 1.0 / n_assets
+        # 參數設定
+        lookback_vol = 63   # 波動度觀察期 (約3個月)
+        lookback_mom = 126  # 動量觀察期 (約6個月)
 
-        # 2. Rolling Optimization
-        for i in range(robust_lookback, len(self.price), rebalance_freq):
-            current_date = self.price.index[i]
-
-            # Data Window
-            window_returns = self.returns[universe].iloc[i - robust_lookback : i]
-
-            # A. Filter for Valid Assets (Remove assets with 0 variance, e.g., XLC pre-2018)
-            # If std is 0, the optimizer might dump 100% there, which is a data artifact.
-            valid_assets = [a for a in universe if window_returns[a].std() > 1e-5]
-            if not valid_assets:
+        for i in range(len(self.price)):
+            # 1. 暖身期檢查
+            # 必須大於最長的 lookback 才能計算指標，否則使用等權重
+            if i < lookback_mom:
+                equal_weight = 1.0 / len(assets) if len(assets) > 0 else 0
+                self.portfolio_weights.loc[self.price.index[i], assets] = equal_weight
+                self.portfolio_weights.loc[self.price.index[i], self.exclude] = 0.0
                 continue
 
-            # B. Calculate Momentum (Cumulative Return)
-            momentum = (1 + window_returns[valid_assets]).prod() - 1
-
-            # Check Regime: Are we in a broad Bull or Bear market?
-            # If fewer than 2 assets are positive, play Defense (GMV on all valid).
-            # Otherwise, play Offense (Top 4).
-            positive_momentum_assets = momentum[momentum > 0].index.tolist()
-
-            if len(positive_momentum_assets) >= 2:
-                # --- OFFENSE: Min-Var on Top 4 Winners ---
-                # Select Top 4 from the valid assets
-                selected_assets = momentum.nlargest(n_top).index.tolist()
-            else:
-                # --- DEFENSE: GMV on All Valid Assets ---
-                selected_assets = valid_assets
-
-            n_sel = len(selected_assets)
-
-            # C. Optimization
-            # Calculate covariance for selected assets
-            subset_returns = window_returns[selected_assets]
-            Sigma = subset_returns.cov().values
-            Sigma += 1e-6 * np.eye(n_sel) # Regularization
-
             try:
-                m = gp.Model("MomMinVar")
-                m.setParam("OutputFlag", 0)
+                current_date = self.price.index[i]
 
-                # Weights
-                w = m.addVars(n_sel, lb=0.0, ub=1.0, name="w")
+                # 2. 計算動量 (Momentum) - 過去 126 天的報酬率
+                # 公式: (P_t / P_{t-126}) - 1
+                momentum = (self.price[assets].iloc[i] / self.price[assets].iloc[i - lookback_mom]) - 1
 
-                # Fully Invested
-                m.addConstr(gp.quicksum(w[j] for j in range(n_sel)) == 1, "Budget")
+                # 3. 計算波動度 (Volatility) - 過去 63 天的日報酬標準差 (年化)
+                # 使用 replace 避免除以 0 的錯誤
+                volatility = self.returns[assets].iloc[i - lookback_vol:i].std() * np.sqrt(252)
+                volatility = volatility.replace(0, 0.001)
 
-                # Minimize Variance
-                p_var = gp.QuadExpr()
-                for r in range(n_sel):
-                    for c in range(n_sel):
-                        p_var += w[r] * w[c] * Sigma[r][c]
+                # 4. 資產篩選 (Asset Selection)
+                # 選擇動量排名前 50% 的資產
+                momentum_rank = momentum.rank(ascending=False) # 1 為最高動量
+                n_top = int(len(assets) * 0.5)
+                # 確保至少選一個，避免全部被篩掉
+                n_top = max(n_top, 1)
 
-                m.setObjective(p_var, GRB.MINIMIZE)
+                selected_assets = momentum_rank[momentum_rank <= n_top].index
 
-                m.optimize()
+                # 如果篩選結果為空（極端情況），則使用全部資產
+                if len(selected_assets) == 0:
+                    selected_assets = assets
 
-                if m.status == GRB.OPTIMAL:
-                    opt_w = [w[j].X for j in range(n_sel)]
-                    self.portfolio_weights.loc[current_date, selected_assets] = opt_w
-                else:
-                    # Fallback
-                    self.portfolio_weights.loc[current_date, selected_assets] = 1.0 / n_sel
+                # 5. 權重分配：逆波動度加權 (Inverse Volatility Weighting)
+                # 波動度越低，權重越高
+                inv_vol = 1.0 / volatility[selected_assets]
+                total_inv_vol = inv_vol.sum()
 
-            except Exception:
-                self.portfolio_weights.loc[current_date, selected_assets] = 1.0 / n_sel
+                # 歸一化權重 (Normalize)
+                target_weights = inv_vol / total_inv_vol
+
+                # 6. 將權重寫入 portfolio_weights
+                # 被選中的資產分配計算出的權重
+                self.portfolio_weights.loc[current_date, selected_assets] = target_weights
+
+                # 未被選中的資產權重設為 0
+                unselected_assets = assets.difference(selected_assets)
+                self.portfolio_weights.loc[current_date, unselected_assets] = 0.0
+
+            except Exception as e:
+                # 錯誤處理：若計算失敗則退回等權重
+                # print(f"Error at {self.price.index[i]}: {e}") # 除錯用
+                equal_weight = 1.0 / len(assets) if len(assets) > 0 else 0
+                self.portfolio_weights.loc[self.price.index[i], assets] = equal_weight
+
+            # 確保排除資產 (SPY) 權重為 0
+            self.portfolio_weights.loc[self.price.index[i], self.exclude] = 0.0
 
         """
         TODO: Complete Task 4 Above
